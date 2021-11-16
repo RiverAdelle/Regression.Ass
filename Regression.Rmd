@@ -1,0 +1,242 @@
+---
+title: <center><h1>Spatial Regression Assignment</h1></center>
+author: 
+  <center>River A. Watson</center>
+output: rmdformats::downcute
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r packages, include=FALSE}
+packages <- c("biscale", "cleangeo", "cowplot", "dplyr", "geosphere", 
+            "ggplot2", "maps", "maptools", "rgdal", "rgeos", "sf", 
+            "sp", "spatialreg", "spdep", "tidyr", "rmdformats")
+sapply(packages, require, character.only=T)
+```
+
+
+```{r data}
+data <- read.csv('childpov18_southfull.csv', 
+                 colClasses = c("character", "character", "character", 
+                                "numeric", "numeric", "numeric", "numeric",
+                                "numeric", "numeric", "numeric", "numeric",
+                                "numeric", "numeric", "numeric", "numeric", 
+                                "numeric", "numeric", "numeric", "numeric",
+                                "numeric", "numeric", "numeric", "numeric",
+                                "numeric", "numeric", "numeric", "numeric", 
+                                "numeric", "numeric", "numeric", "numeric",
+                                "numeric", "numeric", "numeric", "numeric"))
+names(data)[names(data)=="X2016.child.poverty"] <- "child.pov.2016"
+ARpov <- data %>% subset(State == "AR")
+ARpov[, c(3,6:35)]
+```
+
+```{r contiguity neighbors}
+fips <- county.fips
+fips.codes <- separate(data = fips, col = polyname, into = c("state", "county"), sep = ",")
+ar_fips <- subset(fips.codes, state=="arkansas", select=fips)
+
+arkmap <- map(database = "county", regions = "arkansas", fill=T, plot=F)
+ar_sp = map2SpatialPolygons(arkmap,ar_fips$fips,CRS("+proj=longlat"))
+```
+
+```{r OLS}
+equation <- child.pov.2016 ~ rural + urban + lnmanufacturing + lnag + 
+  lnretail + lnhealthss + lnconstruction + lnlesshs + 
+  lnunemployment + lnsinglemom + lnblack + lnhispanic + 
+  lnuninsured + lnincome_ratio + lnteenbirth + lnunmarried
+options(scipen = 5)
+ols <- lm(equation, data=ARpov)
+summary(ols)
+#uninsured and teen birth are significant
+```
+
+
+```{r cleaning}
+library(janitor)
+library(cleangeo)
+library(spdep)
+cleaned <- clgeo_Clean(ar_sp)
+neighb.data <- poly2nb(cleaned, queen=T)
+cont.neighb <- nb2listw(neighb.data,style="W", zero.policy = TRUE)
+```
+
+```{r Morans Correlation and LaGrange Multiplier Tests}
+lm.morantest(ols, cont.neighb)
+#Fail to reject the null hypothesis, no spatial correlation
+lm.LMtests(ols, cont.neighb, test="all")
+#RLMerr is significant
+```
+
+```{r saptial error model}
+sp.err.model <- spatialreg::errorsarlm(equation, data=ARpov, cont.neighb)
+summary(sp.err.model, Nagelkerke = TRUE)
+# 9 significant values: Jobs such as healthcare, construction, unemployed, no hs degree, single mom, minorities, uninsured and teen birth
+spatialreg::Hausman.test(sp.err.model)
+#reject the null hypothesis that this should yield coefficients appropriate for a spatial error model 
+```
+
+```{r Spatial Durbin Error}
+sd.err <- spatialreg::errorsarlm(equation, ARpov, cont.neighb, etype = "emixed")
+sdm <- spatialreg::lagsarlm(equation, ARpov, cont.neighb, type = "mixed")
+summary(sd.err, Nagelkerke = TRUE)
+summary(spatialreg::impacts(sd.err, listw = cont.neighb, R = 100), zstats = TRUE)[["pzmat"]]
+#all are significant
+library(spatialreg)
+LR.Sarlm(sd.err,sp.err.model)
+#reject the null should not restrict he model to a spatial error model
+```
+## Not ran yet##
+
+```{r K nearest neighbot}
+all.xy <-centroid(ar_sp)
+colnames(all.xy) <- c("x","y")
+
+#Create neighbors
+all.dist.k1 <- knn2nb(knearneigh(all.xy, k=1, longlat = TRUE))
+all.dist.k3 <- knn2nb(knearneigh(all.xy, k=3, longlat = TRUE))
+all.dist.k5 <- knn2nb(knearneigh(all.xy, k=5, longlat = TRUE))
+
+#Determine max k distance value to neighbor
+all.max.k1 <- max(unlist(nbdists(all.dist.k1, all.xy, longlat=TRUE)))
+all.max.k3 <- max(unlist(nbdists(all.dist.k3, all.xy, longlat=TRUE)))
+all.max.k5 <- max(unlist(nbdists(all.dist.k5, all.xy, longlat=TRUE)))
+
+#Calculate neighbors based on distance
+all.sp.dist.k1 <- dnearneigh(all.xy, d1=0, d2=1 * all.max.k1, longlat = TRUE)
+all.sp.dist.k3 <- dnearneigh(all.xy, d1=0, d2=1 * all.max.k3, longlat = TRUE)
+all.sp.dist.k5 <- dnearneigh(all.xy, d1=0, d2=1 * all.max.k5, longlat = TRUE)
+
+#Create neighbor list
+all.dist.neighb.k1 <- nb2listw(all.sp.dist.k1,style="W", zero.policy = TRUE)
+all.dist.neighb.k3 <- nb2listw(all.sp.dist.k3,style="W", zero.policy = TRUE)
+all.dist.neighb.k5 <- nb2listw(all.sp.dist.k5,style="W", zero.policy = TRUE)
+```
+
+```{r distance lag model}
+all.dist.lag.k1 <- spatialreg::lagsarlm(equation, data = ARpov, listw = all.dist.neighb.k1)
+all.dist.lag.k3 <- spatialreg::lagsarlm(equation, data = ARpov, listw = all.dist.neighb.k3)
+all.dist.lag.k5 <- spatialreg::lagsarlm(equation, data = ARpov, listw = all.dist.neighb.k5)
+
+summary(all.dist.lag.k1, Nagelkerke = TRUE)
+```
+
+```{r distance error model}
+all.dist.err.k1 <- spatialreg::errorsarlm(equation, data = ARpov, listw = all.dist.neighb.k1)
+all.dist.err.k3 <- spatialreg::errorsarlm(equation, data = ARpov, listw = all.dist.neighb.k3)
+all.dist.err.k5 <- spatialreg::errorsarlm(equation, data = ARpov, listw = all.dist.neighb.k5)
+
+summary(all.dist.err.k1, Nagelkerke = TRUE)
+```
+
+```{r mapping results}
+dist.err.data <- summary(all.dist.err.k1, correlation=TRUE, Nagelkerke = TRUE)
+
+dist.err.output <- cbind.data.frame(ARpov$FIPS,
+                                    dist.err.data$fitted.values, 
+                                    dist.err.data$residual, 
+                                    ARpov$child.pov.2016, 
+                                    ARpov$lnhealthss,
+                                    ARpov$lnconstruction,
+                                    ARpov$lnlesshs,
+                                    ARpov$lnunemployment,
+                                    ARpov$lnsinglemom,
+                                    ARpov$lnblack,
+                                    ARpov$lnhispanic,
+                                    ARpov$lnuninsured,
+                                    ARpov$lnteenbirth,
+                                    stringsAsFactors = FALSE)
+library(biscale)
+#Renaming columns
+colnames(dist.err.output) <- c("fips","fitted","resid","childpov", "healthss", "construction", "lesshs", "unemployed", "singlemom", "black", "hispanic", "uninsured", "teenbirth")
+
+ar_fortify <- fortify(ar_sp)
+
+ar_poly <- merge(x = ar_fortify, y = dist.err.output, 
+                 by.x = "id", by.y = "fips", all = TRUE)
+
+bivariate_data <- bi_class(ar_poly, x = childpov, y = teenbirth, 
+                           dim = 3, style = "quantile")
+
+legend <- bi_legend(pal = "DkViolet",
+                    dim = 3,
+                    xlab = "Child Poverty",
+                    ylab = "Teen Birth",
+                    size = 6)
+
+world <- map_data("world")
+states <- map_data("state")
+southern_states <- subset(states, region %in% 
+                            c("texas", "arkansas", "louisiana", "mississippi", 
+                              "alabama", "georgia", "florida", "north carolina",
+                              "south carolina", "tennessee", "oklahoma", 
+                              "kentucky", "west virginia", "virginia", 
+                              "maryland", "delaware", "district of columbia"))
+pov_map <- ggplot() + 
+  geom_polygon(data = world, aes(x=long,y=lat, group=group), fill = "gray95", color = "white") +
+  geom_polygon(data = states, aes(x=long,y=lat, group=group), fill = "gray", color = "white") +
+  geom_polygon(data = southern_states, aes(x=long,y=lat, group=group), fill = NA, size = 0.01, color = "white") +  
+  geom_polygon(data = bivariate_data, aes(x=long, y=lat, group=group, fill = bi_class), color = "grey50", show.legend = FALSE) + 
+  bi_scale_fill(pal = "DkViolet", dim = 3) +
+  coord_map("conic", lat0 = 30, xlim=c(-95,-89.5), ylim=c(32.5,37)) +
+  theme_void() + theme(legend.title.align=0.5) +
+  theme(panel.background = element_rect(fill = 'deepskyblue'),
+        panel.grid.major = element_line(colour = NA)) +
+  labs(x = "Longitude", y = "Latitude", fill = "Child Poverty", 
+       title = "Bivariate Map of Child Poverty and Teen Birth") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+pov_map
+
+final_map <- ggdraw() +
+  draw_plot(pov_map, 0, 0, 1, 1) +
+  draw_plot(legend, 0.60, 0.035, 0.25, 0.25)
+final_map
+
+
+```
+
+```{r second map}
+dist.ols.data <- summary(ols, correlation=TRUE, Nagelkerke = TRUE)
+
+dist.ols.output <- cbind.data.frame(ARpov$FIPS,
+                                    dist.err.data$fitted.values, 
+                                    dist.err.data$residual, 
+                                    ARpov$child.pov.2016, 
+                                    ARpov$lnuninsured,
+                                    ARpov$lnteenbirth,
+                                    stringsAsFactors = FALSE)
+#Renaming columns
+colnames(dist.ols.output) <- c("fips","fitted","resid","childpov", "uninsured", "teenbirth")
+bivariate_data2 <- bi_class(ar_poly, x = childpov, y = teenbirth, 
+                           dim = 3, style = "quantile")
+
+legend2 <- bi_legend(pal = "DkViolet",
+                    dim = 3,
+                    xlab = "Child Poverty",
+                    ylab = "Teen Birth",
+                    size = 6)
+pov_map2 <- ggplot() + 
+  geom_polygon(data = world, aes(x=long,y=lat, group=group), fill = "gray95", color = "white") +
+  geom_polygon(data = states, aes(x=long,y=lat, group=group), fill = "gray", color = "white") +
+  geom_polygon(data = southern_states, aes(x=long,y=lat, group=group), fill = NA, size = 0.01, color = "white") +  
+  geom_polygon(data = bivariate_data2, aes(x=long, y=lat, group=group, fill = bi_class), color = "grey50", show.legend = FALSE) + 
+  bi_scale_fill(pal = "DkViolet", dim = 3) +
+  coord_map("conic", lat0 = 30, xlim=c(-95,-89.5), ylim=c(32.5,37)) +
+  theme_void() + theme(legend.title.align=0.5) +
+  theme(panel.background = element_rect(fill = 'deepskyblue'),
+        panel.grid.major = element_line(colour = NA)) +
+  labs(x = "Longitude", y = "Latitude", fill = "Child Poverty", 
+       title = "Bivariate Map of Child Poverty and Teen Birth") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+pov_map2
+
+final_map2 <- ggdraw() +
+  draw_plot(pov_map2, 0, 0, 1, 1) +
+  draw_plot(legend2, 0.60, 0.035, 0.25, 0.25)
+final_map2
+
+```
+
